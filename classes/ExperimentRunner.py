@@ -131,7 +131,7 @@ class ExperimentRunner:
             xb, yb = xb.to(self.device), yb.to(self.device)
             optimizer.zero_grad()
 
-            pred = model(xb)
+            pred = model(xb).to(self.device)
             loss = self.exp_config.criterion(pred, yb)
 
             loss.backward()
