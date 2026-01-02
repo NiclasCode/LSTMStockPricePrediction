@@ -15,7 +15,7 @@ from classes.models.DashboardParams import DashboardParams
 from classes.models.ExperimentConfig import ExperimentConfig
 from classes.models.HyperparamConfig import HyperparamConfig
 from classes.models.LoaderSet import LoaderSet
-from classes.models.ModelMetrics import ModelMetrics
+from classes.models.MetricsSummary import MetricsSummary
 
 
 class ExperimentRunner:
@@ -302,7 +302,7 @@ class ExperimentRunner:
         return unscaled[:, 0]
 
     @staticmethod
-    def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, loss: float) -> ModelMetrics:
+    def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, loss: float) -> MetricsSummary:
         """
         Compute standard regression metrics and directional accuracy.
 
@@ -332,7 +332,7 @@ class ExperimentRunner:
         else:
             directional_accuracy = float("nan")
 
-        return ModelMetrics(
+        return MetricsSummary(
             loss=float(loss),
             mae=mae,
             rmse=rmse,
