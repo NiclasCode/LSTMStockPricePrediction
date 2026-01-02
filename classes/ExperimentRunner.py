@@ -1,16 +1,20 @@
+from datetime import datetime
 from itertools import product
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 
 from classes.ArtifactManager import ArtifactManager
 from classes.DataManager import DataManager
 from classes.LSTMRegressor import LSTMRegressor
 from classes.LiveLossPlot import LiveLossPlot
 from classes.PlotFactory import PlotFactory
+from classes.TradingStrategy import TradingStrategy
 from classes.models.DashboardParams import DashboardParams
 from classes.models.ExperimentConfig import ExperimentConfig
 from classes.models.HyperparamConfig import HyperparamConfig
@@ -39,7 +43,9 @@ class ExperimentRunner:
         self.device = device
 
         self.data_manager: Optional[DataManager] = None
-        self.artifact_manager = ArtifactManager(exp_config.save_path)
+        timestamp = datetime.now().strftime("%y-%m-%d_%H-%M-%S")
+        experiment_root = Path(exp_config.save_path) / f"{exp_config.target}_{timestamp}"
+        self.artifact_manager = ArtifactManager(experiment_root)
 
         self.best_val_loss = float("inf")
         self.best_model: Optional[LSTMRegressor] = None
@@ -237,17 +243,27 @@ class ExperimentRunner:
         """
         if self.best_hyperparam_config is None:
             raise ValueError("No best model available. Run experiments before evaluation.")
+
         loader_set = self.data_manager.build_loaders(self.best_hyperparam_config)
+
         loss, predictions, trues = self.predict(loader_set.test_loader)
+
         y_pred = self._inverse_scale_target(predictions)
         y_true = self._inverse_scale_target(trues)
+        y_pred_scaled = np.asarray(predictions).reshape(-1)
+        y_true_scaled = np.asarray(trues).reshape(-1)
+
         metrics = self.compute_metrics(y_true, y_pred, loss)
         print(metrics.to_dict())
+
         fig = PlotFactory.plot_predictions(y_true, y_pred)
-        run_dir = self.artifact_manager.run_dir(self.best_hyperparam_config)
+        fig_scaled = PlotFactory.plot_predictions(y_true_scaled, y_pred_scaled)
+
+        run_dir = self.artifact_manager.best_run_dir()
+        self.artifact_manager.save_checkpoint(run_dir, self.best_model, self.best_hyperparam_config)
         self.artifact_manager.save_figure(fig, run_dir, "predictions")
+        self.artifact_manager.save_figure(fig_scaled, run_dir, "predictions_scaled")
         self.artifact_manager.save_json(run_dir / "metrics.json", metrics.to_dict())
-        # fig = PlotFactory.plot_accuracy()
 
     def predict(self, loader: DataLoader) -> Tuple[float, np.ndarray, np.ndarray]:
         """
@@ -301,6 +317,9 @@ class ExperimentRunner:
         unscaled = self.data_manager.scaler.inverse_transform(dummy)
         return unscaled[:, 0]
 
+    def get_best_hyperparam_config(self) -> HyperparamConfig:
+        return self.best_hyperparam_config
+
     @staticmethod
     def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, loss: float) -> MetricsSummary:
         """
@@ -312,7 +331,8 @@ class ExperimentRunner:
             loss: Average loss computed on scaled values.
 
         Returns:
-            ModelMetrics dataclass with computed metrics.
+            MetricsSummary dataclass with computed metrics, including a naive
+            baseline RMSE (predict last observed value).
         """
         y_true = np.asarray(y_true).reshape(-1)
         y_pred = np.asarray(y_pred).reshape(-1)
@@ -332,17 +352,144 @@ class ExperimentRunner:
         else:
             directional_accuracy = float("nan")
 
+        naive_rmse = float("nan")
+        if len(y_true) >= 2:
+            naive_pred = y_true[:-1]
+            naive_true = y_true[1:]
+            naive_rmse = float(np.sqrt(np.mean((naive_true - naive_pred) ** 2)))
+
         return MetricsSummary(
             loss=float(loss),
             mae=mae,
             rmse=rmse,
             r2=r2,
             directional_accuracy=directional_accuracy,
+            naive_rmse=naive_rmse,
             n_samples=int(len(y_true)),
             scale="unscaled",
             loss_scale="scaled",
         )
 
+
+    def _predict_full_series(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Predict target values for all available dates after window/horizon.
+        """
+        if self.best_model is None or self.best_hyperparam_config is None:
+            raise ValueError("No trained model available for prediction.")
+        if self.data_manager is None or self.data_manager.scaled_data is None or self.data_manager.df is None:
+            raise ValueError("Data not prepared. Call prepare() first.")
+
+        cfg = self.best_hyperparam_config
+        scaled = self.data_manager.scaled_data
+        X, _ = self.data_manager.create_sequences(scaled, scaled[:, 0], cfg.window_size, cfg.horizon)
+        if len(X) == 0:
+            return np.array([]), np.array([])
+
+        self.best_model.to(self.device)
+        self.best_model.eval()
+
+        tensor_x = torch.from_numpy(X).float()
+        dataset = TensorDataset(tensor_x)
+        loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False)
+
+        preds = []
+        with torch.no_grad():
+            for (xb,) in loader:
+                xb = xb.to(self.device)
+                pred = self.best_model(xb).to(device=self.device)
+                preds.append(pred.cpu().numpy())
+
+        preds = np.concatenate(preds).reshape(-1)
+        unscaled_preds = self._inverse_scale_target(preds)
+        dates = pd.to_datetime(self.data_manager.df.index)
+        start_idx = cfg.window_size - 1 + cfg.horizon
+        pred_dates = dates[start_idx:]
+
+        if len(pred_dates) != len(unscaled_preds):
+            min_len = min(len(pred_dates), len(unscaled_preds))
+            pred_dates = pred_dates[:min_len]
+            unscaled_preds = unscaled_preds[:min_len]
+
+        return unscaled_preds, pred_dates.to_numpy()
+
+    def simulate_trading(
+        self,
+        start_date: str,
+        end_date: str,
+        starting_capital: float,
+        strategy: TradingStrategy,
+    ) -> dict:
+        """
+        Simulate a trading strategy over a date range using model predictions.
+        """
+        if self.data_manager is None or self.data_manager.df is None:
+            raise ValueError("Data not prepared. Call prepare() first.")
+        if self.best_model is None or self.best_hyperparam_config is None:
+            raise ValueError("No trained model available for simulation.")
+
+        preds, pred_dates = self._predict_full_series()
+        if len(preds) == 0:
+            raise ValueError("No predictions available for simulation.")
+
+        df = self.data_manager.df.copy()
+        if self.exp_config.target not in df.columns:
+            raise ValueError(f"Target column not found: {self.exp_config.target}")
+
+        price_df = pd.DataFrame({
+            "date": pd.to_datetime(df.index),
+            "price": df[self.exp_config.target].to_numpy(dtype=float),
+        })
+        pred_df = pd.DataFrame({
+            "date": pd.to_datetime(pred_dates),
+            "predicted": preds.astype(float),
+        })
+        merged = pd.merge(price_df, pred_df, on="date", how="inner").sort_values("date")
+
+        start_ts = pd.to_datetime(start_date)
+        end_ts = pd.to_datetime(end_date)
+        sim = merged[(merged["date"] >= start_ts) & (merged["date"] <= end_ts)].reset_index(drop=True)
+        sim = sim.dropna(subset=["price", "predicted"])
+        if len(sim) < 2:
+            raise ValueError("Not enough data points in the requested date range.")
+
+        equity = float(starting_capital)
+        positions = []
+        returns = []
+        equity_curve = []
+
+        for i in range(len(sim)):
+            price = float(sim.loc[i, "price"])
+            predicted = float(sim.loc[i, "predicted"])
+            history = sim.loc[:i, "price"].to_numpy(dtype=float)
+            position = strategy.decide(history, price, predicted)
+            positions.append(position)
+
+            if i < len(sim) - 1 and price != 0.0:
+                next_price = float(sim.loc[i + 1, "price"])
+                daily_ret = (next_price - price) / price
+                equity *= (1.0 + position * daily_ret)
+                returns.append(daily_ret * position)
+            else:
+                returns.append(0.0)
+
+            equity_curve.append(equity)
+
+        sim["position"] = positions
+        sim["strategy_return"] = returns
+        sim["equity"] = equity_curve
+
+        total_return = float("nan")
+        if starting_capital != 0.0:
+            total_return = equity / starting_capital - 1.0
+
+        sim.attrs["summary"] = {
+            "final_equity": equity,
+            "total_return": total_return,
+            "start_date": start_ts,
+            "end_date": end_ts,
+        }
+        return sim
 
     def build_hyperparam_configs(self, dashboard_params: DashboardParams) -> List[HyperparamConfig]:
         """

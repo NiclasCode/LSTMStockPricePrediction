@@ -25,31 +25,6 @@ class PlotFactory:
 
         plt.show()
         return fig
-    
-    @staticmethod
-    def plot_accuracy(history: dict) -> plt.Figure:
-        """Creates and displays a pie chart showing accuracy distribution.
-
-        Args:
-            history: Dictionary containing training history with 'accuracy' values
-
-        Returns:
-            matplotlib.figure.Figure: The generated pie chart figure
-        """
-        fig, ax = plt.subplots(figsize=(8, 8))
-
-        accuracy = history.get('accuracy', 0)
-        error = 100 - accuracy
-
-        ax.pie([accuracy, error],
-               labels=['Accurate', 'Error'],
-               autopct='%1.1f%%',
-               colors=['lightgreen', 'lightcoral'])
-
-        ax.set_title('Model Accuracy Distribution')
-
-        plt.show()
-        return fig
 
     @staticmethod
     def plot_predictions(y_true, y_pred) -> plt.Figure:
