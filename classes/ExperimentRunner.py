@@ -264,6 +264,7 @@ class ExperimentRunner:
         self.artifact_manager.save_figure(fig, run_dir, "predictions")
         self.artifact_manager.save_figure(fig_scaled, run_dir, "predictions_scaled")
         self.artifact_manager.save_json(run_dir / "metrics.json", metrics.to_dict())
+        self.run_shap_analysis(run_dir=run_dir)
 
     def predict(self, loader: DataLoader) -> Tuple[float, np.ndarray, np.ndarray]:
         """
@@ -547,3 +548,69 @@ class ExperimentRunner:
                 dashboard_params.lrs,
                 dashboard_params.optimizers,
             )]
+
+    def run_shap_analysis(
+        self,
+        run_dir: Optional[Path] = None,
+        max_background: int = 128,
+        max_samples: int = 256,
+    ) -> pd.DataFrame:
+        """
+        Compute a SHAP summary for the best model on the test split.
+
+        The analysis aggregates mean absolute SHAP values over timesteps,
+        returning a per-feature importance table.
+        """
+        if self.best_model is None or self.best_hyperparam_config is None:
+            raise ValueError("No trained model available for SHAP analysis.")
+        if self.data_manager is None or self.data_manager.df is None:
+            raise ValueError("Data not prepared. Call prepare() first.")
+
+        if run_dir is None:
+            run_dir = self.artifact_manager.best_run_dir()
+
+        try:
+            import shap
+        except ImportError as exc:
+            raise ImportError("shap is required for SHAP analysis. Install with pip install shap.") from exc
+
+        loader_set = self.data_manager.build_loaders(self.best_hyperparam_config)
+        background = self._collect_batch_tensors(loader_set.train_loader, max_background)
+        samples = self._collect_batch_tensors(loader_set.test_loader, max_samples)
+
+        if background is None or samples is None:
+            raise ValueError("Not enough data to compute SHAP values.")
+
+        self.best_model.eval()
+        self.best_model.to(self.device)
+
+        explainer = shap.GradientExplainer(self.best_model, background)
+        shap_values = explainer.shap_values(samples)
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
+
+        shap_values = np.asarray(shap_values)
+        mean_abs = np.mean(np.abs(shap_values), axis=(0, 1))
+        feature_names = list(self.data_manager.df.columns)
+        summary = pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs})
+        summary = summary.sort_values("mean_abs_shap", ascending=False)
+        summary.to_csv(run_dir / "shap_summary.csv", index=False)
+        return summary
+
+    def _collect_batch_tensors(self, loader: DataLoader, max_samples: int) -> Optional[torch.Tensor]:
+        """
+        Collect up to max_samples inputs from a DataLoader.
+        """
+        if max_samples <= 0:
+            return None
+        batches = []
+        collected = 0
+        for xb, _ in loader:
+            batches.append(xb)
+            collected += xb.size(0)
+            if collected >= max_samples:
+                break
+        if not batches:
+            return None
+        data = torch.cat(batches, dim=0)[:max_samples]
+        return data.to(self.device)
