@@ -591,7 +591,14 @@ class ExperimentRunner:
 
         shap_values = np.asarray(shap_values)
         mean_abs = np.mean(np.abs(shap_values), axis=(0, 1))
+        if mean_abs.ndim > 1:
+            mean_abs = mean_abs.reshape(mean_abs.shape[0], -1).mean(axis=1)
         feature_names = list(self.data_manager.df.columns)
+        if len(feature_names) != mean_abs.shape[0]:
+            raise ValueError(
+                "SHAP feature mismatch: "
+                f"{len(feature_names)} feature names vs {mean_abs.shape[0]} SHAP values."
+            )
         summary = pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs})
         summary = summary.sort_values("mean_abs_shap", ascending=False)
         summary.to_csv(run_dir / "shap_summary.csv", index=False)
