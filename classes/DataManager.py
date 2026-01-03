@@ -33,7 +33,11 @@ class DataManager:
     def select_features(self, features: list) -> pd.DataFrame:
         print("Features", features)
         print("Dataframe", self.df.columns.values)
-        self.df = self.df[features]
+        ordered = list(features)
+        if self.exp_config.target in ordered:
+            ordered.remove(self.exp_config.target)
+        ordered.insert(0, self.exp_config.target)
+        self.df = self.df[ordered]
         return self.df
 
     def denoise_series(self, x: np.ndarray) -> np.ndarray:

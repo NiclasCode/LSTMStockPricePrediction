@@ -1,11 +1,13 @@
+import json
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 
 import pandas as pd
 import panel as pn
 import torch
 from panel import Column, Card, Row
-from panel.widgets import CheckBoxGroup, MultiChoice, IntInput, TextInput, Checkbox, Tabulator
+from panel.widgets import CheckBoxGroup, MultiChoice, IntInput, TextInput, Checkbox, Tabulator, Button
 
 from classes.models.DashboardParams import DashboardParams
 from classes.models.ExperimentConfig import ExperimentConfig
@@ -63,6 +65,8 @@ class Dashboard:
         self.out_status = pn.pane.Markdown("Ready.")
         self.out_table = Tabulator(pd.DataFrame(), height=300, pagination="local", page_size=20)
         self.out_best = Tabulator(pd.DataFrame(), height=250, pagination="local", page_size=10)
+        self.w_results_root = TextInput(name="results root", value=str(self.exp_config.save_path))
+        self.w_refresh_results = Button(name="Refresh Results", button_type="primary")
 
         self.dashboard = None
 
@@ -97,8 +101,12 @@ class Dashboard:
                 collapsed=False
             )
         )
-        w_outputs = Row(self.out_status, self.out_table, self.out_best)
-        self.dashboard = Column(w_inputs, w_outputs)
+        self.w_refresh_results.on_click(self._on_refresh_results)
+        self.refresh_results()
+
+        w_outputs = Column(self.out_status, self.out_table, self.out_best)
+        results_controls = Row(self.w_results_root, self.w_refresh_results)
+        self.dashboard = Column(w_inputs, results_controls, w_outputs)
         return self.dashboard
 
     def serve(self):
@@ -117,3 +125,69 @@ class Dashboard:
             dropouts=self.w_dropouts.value,
             optimizers=[OptimizerType[opt].value for opt in self.w_opts.value],
         )
+
+    def _on_refresh_results(self, _event=None):
+        self.refresh_results()
+
+    def refresh_results(self) -> None:
+        results_root = Path(self.w_results_root.value)
+        runs_df, best_df, status = self._load_results(results_root)
+        self.out_table.value = runs_df
+        self.out_best.value = best_df
+        self.out_status.object = status
+
+    @staticmethod
+    def _safe_read_json(path: Path) -> dict:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _load_results(self, results_root: Path) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+        if not results_root.exists():
+            return pd.DataFrame(), pd.DataFrame(), f"Results root not found: `{results_root}`"
+
+        run_rows = []
+        best_rows = []
+
+        for exp_dir in sorted([p for p in results_root.iterdir() if p.is_dir()]):
+            best_dir = exp_dir / "best_run"
+            if best_dir.exists():
+                metrics_path = best_dir / "metrics.json"
+                metrics = self._safe_read_json(metrics_path) if metrics_path.exists() else {}
+                best_rows.append({
+                    "experiment": exp_dir.name,
+                    "best_run_path": str(best_dir),
+                    "has_checkpoint": (best_dir / "checkpoint.pt").exists(),
+                    "has_predictions": (best_dir / "predictions.png").exists(),
+                    "has_predictions_scaled": (best_dir / "predictions_scaled.png").exists(),
+                    "loss": metrics.get("loss"),
+                    "mae": metrics.get("mae"),
+                    "rmse": metrics.get("rmse"),
+                    "r2": metrics.get("r2"),
+                    "directional_accuracy": metrics.get("directional_accuracy"),
+                })
+
+            for run_dir in sorted([p for p in exp_dir.iterdir() if p.is_dir() and p.name != "best_run"]):
+                config_path = run_dir / "config.json"
+                config = self._safe_read_json(config_path) if config_path.exists() else {}
+                run_rows.append({
+                    "experiment": exp_dir.name,
+                    "run_name": run_dir.name,
+                    "run_path": str(run_dir),
+                    "window_size": config.get("window_size"),
+                    "horizon": config.get("horizon"),
+                    "batch_size": config.get("batch_size"),
+                    "patience": config.get("patience"),
+                    "hidden_size": config.get("hidden_size"),
+                    "num_layers": config.get("num_layers"),
+                    "dropout": config.get("dropout"),
+                    "lr": config.get("lr"),
+                    "optimizer": config.get("optimizer"),
+                    "seed": config.get("seed"),
+                    "has_checkpoint": (run_dir / "checkpoint.pt").exists(),
+                    "has_loss_curve": (run_dir / "loss_curve.png").exists(),
+                })
+
+        status = f"Loaded {len(run_rows)} runs across {len(best_rows)} experiments."
+        return pd.DataFrame(run_rows), pd.DataFrame(best_rows), status

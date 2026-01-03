@@ -1,6 +1,5 @@
 from dataclasses import asdict
 
-from classes.models.ExperimentConfig import ExperimentConfig
 from classes.models.HyperparamConfig import HyperparamConfig
 from pathlib import Path
 import json
@@ -25,6 +24,14 @@ class ArtifactManager:
         """
         self.root_dir = Path(root_dir)
         self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def best_run_dir(self) -> Path:
+        """
+        Build and create the directory for the best run artifacts.
+        """
+        d = self.root_dir / "best_run"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def run_dir(self, cfg: HyperparamConfig) -> Path:
         """
