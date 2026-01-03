@@ -472,6 +472,7 @@ class ExperimentRunner:
                 position = 0.0
 
             positions.append(position)
+            equity_curve.append(equity)
 
             if i < len(sim) - 1 and price != 0.0:
                 next_price = float(sim.loc[i + 1, "price"])
@@ -480,8 +481,6 @@ class ExperimentRunner:
                 returns.append(daily_ret * position)
             else:
                 returns.append(0.0)
-
-            equity_curve.append(equity)
 
         sim["position"] = positions
         sim["strategy_return"] = returns
