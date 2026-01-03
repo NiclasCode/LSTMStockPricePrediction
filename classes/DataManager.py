@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pywt
 import torch
+from IPython.core.display_functions import display
 from torch.utils.data import DataLoader
 
 from classes.models.ExperimentConfig import ExperimentConfig
@@ -27,7 +28,7 @@ class DataManager:
         self.df = pd.read_csv(self.exp_config.file_path, header=[0, 1], index_col=0)
         self.df.columns = self.format_columns(self.df)
         self.raw_data = self.df.copy()
-        print("Test", self.raw_data)
+        display(self.raw_data)
         return self.df
 
     def select_features(self, features: list) -> pd.DataFrame:

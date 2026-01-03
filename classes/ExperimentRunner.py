@@ -173,6 +173,8 @@ class ExperimentRunner:
                                           "loss_curve", dpi=300)
         self.artifact_manager.save_checkpoint(run_dir, model, hyperparam_config)
 
+        self.live_plot.close()
+
         pass
 
     def train_one_epoch(
