@@ -460,9 +460,14 @@ class ExperimentRunner:
 
         for i in range(len(sim)):
             price = float(sim.loc[i, "price"])
-            predicted = float(sim.loc[i, "predicted"])
             history = sim.loc[:i, "price"].to_numpy(dtype=float)
-            position = strategy.decide(history, price, predicted)
+
+            if i < len(sim) - 1:
+                predicted_next = float(sim.loc[i + 1, "predicted"])
+                position = strategy.decide(history, price, predicted_next)
+            else:
+                position = 0.0
+
             positions.append(position)
 
             if i < len(sim) - 1 and price != 0.0:
@@ -489,6 +494,8 @@ class ExperimentRunner:
             "start_date": start_ts,
             "end_date": end_ts,
         }
+        fig = PlotFactory.plot_equity_comparison(sim, starting_capital=starting_capital)
+        self.artifact_manager.save_figure(fig, self.artifact_manager.best_run_dir(), "equity_curve")
         return sim
 
     def build_hyperparam_configs(self, dashboard_params: DashboardParams) -> List[HyperparamConfig]:
