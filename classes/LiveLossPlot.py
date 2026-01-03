@@ -1,5 +1,6 @@
-from IPython.display import display
 import matplotlib.pyplot as plt
+from IPython.display import display, HTML
+
 
 class LiveLossPlot:
     def __init__(self, update_every: int = 10):
@@ -40,3 +41,14 @@ class LiveLossPlot:
         # Important: redraw + update the same output slot
         self.fig.canvas.draw_idle()
         self.handle.update(self.fig)
+
+    def close(self):
+
+        if self.handle is not None:
+            # Replace only this display slot so other cell output remains.
+            self.handle.update(HTML(""))
+            self.handle = None
+        if self.fig is not None:
+            plt.close(self.fig)
+            self.fig = None
+            self.ax = None
