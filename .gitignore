@@ -1,0 +1,17 @@
+# environments
+.venv/
+.env
+
+
+# PyCharm
+.idea/
+*.iml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# data folders
+/run
+/data
+
+
