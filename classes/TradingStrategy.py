@@ -49,7 +49,7 @@ class TradingStrategy:
         def _rule(_history: Sequence[float], current: float, predicted: float) -> int:
             if predicted > current:
                 return 1
-            if predicted < current:
+            if predicted <= current:
                 return -1
             return 0
 

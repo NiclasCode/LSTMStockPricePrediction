@@ -1,12 +1,14 @@
+import json
 from datetime import datetime
+import copy
 from itertools import product
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from classes.ArtifactManager import ArtifactManager
@@ -42,7 +44,7 @@ class ExperimentRunner:
         self.hyperparam_configs: List[HyperparamConfig] = []
         self.device = device
 
-        self.data_manager: Optional[DataManager] = None
+        self.data_manager: Optional[DataManager] = DataManager(exp_config)
         timestamp = datetime.now().strftime("%y-%m-%d_%H-%M-%S")
         experiment_root = Path(exp_config.save_path) / f"{exp_config.target}_{timestamp}"
         self.artifact_manager = ArtifactManager(experiment_root)
@@ -67,9 +69,6 @@ class ExperimentRunner:
         print(f"Running {len(self.hyperparam_configs)} experiments")
         print(f"First 10 configs: {self.hyperparam_configs[:10]}")
 
-        self.data_manager = DataManager(self.exp_config)
-        self.data_manager.prepare(dashboard_params.features)
-
     def run_grid_search(self) -> None:
         """
         Execute all experiments in the hyperparameter grid.
@@ -86,19 +85,15 @@ class ExperimentRunner:
         """
         print(f"Running experiment: {hyperparam_config}")
 
-        if not hasattr(self, "live_plot"):
-            self.live_plot = LiveLossPlot(update_every=5)
-
-        self.live_plot.reset(title=str(hyperparam_config))
-
-        self.loader_set: LoaderSet = self.data_manager.build_loaders(hyperparam_config)
+        self.data_manager.prepare(hyperparam_config.features)
+        loader_set: LoaderSet = self.data_manager.build_loaders(hyperparam_config)
 
         model = LSTMRegressor(
             n_features=len(hyperparam_config.features),
             hidden_size=hyperparam_config.hidden_size,
             num_layers=hyperparam_config.num_layers,
             dropout=hyperparam_config.dropout
-        )
+        ).to(self.device)
 
         # optional TODO: add parameter weight decay
         optimizer = hyperparam_config.optimizer(
@@ -106,15 +101,15 @@ class ExperimentRunner:
             lr=hyperparam_config.lr
         )
 
-        self.train_model(model, optimizer, hyperparam_config)
+        self.train_model(model, optimizer, hyperparam_config, loader_set)
 
     def train_model(
-        self,
-        model: LSTMRegressor,
-        optimizer: torch.optim.Optimizer,
-        hyperparam_config: HyperparamConfig,
-        max_epochs: int = 250,
-        patience: int = 25,
+            self,
+            model: LSTMRegressor,
+            optimizer: torch.optim.Optimizer,
+            hyperparam_config: HyperparamConfig,
+            loader_set: LoaderSet,
+            max_epochs: int = 250,
     ) -> None:
         """
         Train one model with early stopping and record the best checkpoint.
@@ -125,8 +120,12 @@ class ExperimentRunner:
             hyperparam_config: Hyperparameters used for this run.
             max_epochs: Maximum number of epochs to train.
             patience: Early-stopping patience (epochs without improvement).
+            loader_set: Data loaders for train/val/test splits.
         """
+        if not hasattr(self, "live_plot"):
+            self.live_plot = LiveLossPlot(update_every=5)
 
+        self.live_plot.reset(title=str(hyperparam_config))
         best_val = float("inf")
         best_state = None
         wait = 0
@@ -135,10 +134,8 @@ class ExperimentRunner:
         val_losses = []
 
         for epoch in range(1, max_epochs + 1):
-            train_loss = self.train_one_epoch(model, self.loader_set.train_loader, optimizer)
-            val_loss = self.eval_loss(model, self.loader_set.val_loader)
-
-            # print(f"Epoch {epoch}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+            train_loss = self.train_one_epoch(model, loader_set.train_loader, optimizer)
+            val_loss = self.eval_loss(model, loader_set.val_loader)
 
             if self.live_plot is not None:
                 self.live_plot.update(epoch, train_loss, val_loss)
@@ -148,12 +145,12 @@ class ExperimentRunner:
 
             if val_loss < best_val:
                 best_val = val_loss
-                best_state = model.state_dict()
+                best_state = copy.deepcopy(model.state_dict())
                 wait = 0
             else:
                 wait += 1
 
-            if wait >= patience:
+            if wait >= hyperparam_config.patience:
                 print(f"Early stopping at epoch {epoch}")
                 print(f"Best validation loss: {best_val:.6f} at epoch {epoch - wait}")
                 break
@@ -169,6 +166,7 @@ class ExperimentRunner:
             self.val_losses = val_losses
 
         run_dir = self.artifact_manager.run_dir(hyperparam_config)
+
         self.artifact_manager.save_figure(self.live_plot.fig, run_dir,
                                           "loss_curve", dpi=300)
         self.artifact_manager.save_checkpoint(run_dir, model, hyperparam_config)
@@ -177,11 +175,39 @@ class ExperimentRunner:
 
         pass
 
+    def train_best_model_final(self):
+        """
+        train a new model with the best hyperparameters
+        without early stopping on the Trainings- + Validationdata
+        """
+        model = LSTMRegressor(
+            n_features=len(self.best_hyperparam_config.features),
+            hidden_size=self.best_hyperparam_config.hidden_size,
+            num_layers=self.best_hyperparam_config.num_layers,
+            dropout=self.best_hyperparam_config.dropout
+        ).to(self.device)
+
+        self.data_manager.prepare(self.best_hyperparam_config.features)
+        loader_set: LoaderSet = self.data_manager.build_loaders(self.best_hyperparam_config)
+
+        optimizer = self.best_hyperparam_config.optimizer(
+            model.parameters(),
+            lr=self.best_hyperparam_config.lr
+        )
+        for epoch in range(1, 250):
+            self.train_one_epoch(
+                model,
+                loader_set.train_val_loader,
+                optimizer
+            )
+
+        self.best_model = model
+
     def train_one_epoch(
-        self,
-        model: LSTMRegressor,
-        train_loader: DataLoader,
-        optimizer: torch.optim.Optimizer,
+            self,
+            model: LSTMRegressor,
+            train_loader: DataLoader,
+            optimizer: torch.optim.Optimizer,
     ) -> float:
         """
         Run a single epoch and return the average training loss.
@@ -246,6 +272,7 @@ class ExperimentRunner:
         if self.best_hyperparam_config is None:
             raise ValueError("No best model available. Run experiments before evaluation.")
 
+        self.data_manager.prepare(self.best_hyperparam_config.features)
         loader_set = self.data_manager.build_loaders(self.best_hyperparam_config)
 
         loss, predictions, trues = self.predict(loader_set.test_loader)
@@ -266,19 +293,70 @@ class ExperimentRunner:
         self.artifact_manager.save_figure(fig, run_dir, "predictions")
         self.artifact_manager.save_figure(fig_scaled, run_dir, "predictions_scaled")
         self.artifact_manager.save_json(run_dir / "metrics.json", metrics.to_dict())
-        self.run_shap_analysis(run_dir=run_dir)
+        with torch.backends.cudnn.flags(enabled=False):
+            self.run_shap_analysis(run_dir=run_dir)
 
-    def predict(self, loader: DataLoader) -> Tuple[float, np.ndarray, np.ndarray]:
+    def train_and_evaluate_best_feature_sets(self):
+        """
+        Train and evaluate the best hyperparameters across feature set variants.
+
+        Variants:
+            1) target only
+            2) target + each single feature
+            3) target + all features
+
+        Returns:
+            Mapping of run labels to features and metrics.
+        """
+        if self.best_hyperparam_config is None:
+            raise ValueError("No best hyperparameters available. Run experiments before evaluation.")
+
+        selected_features = list(self.best_hyperparam_config.features)
+        if self.exp_config.target not in selected_features:
+            selected_features.insert(0, self.exp_config.target)
+
+        other_features = [col for col in selected_features if col != self.exp_config.target]
+        feature_sets = [([self.exp_config.target], "target_only")]
+        for feature in other_features:
+            feature_sets.append(([self.exp_config.target, feature], f"target_plus_{feature}"))
+        if other_features:
+            feature_sets.append(([self.exp_config.target] + other_features, "target_plus_all"))
+
+        for features, label in feature_sets:
+            cfg = HyperparamConfig(
+                features=list(features),
+                window_size=self.best_hyperparam_config.window_size,
+                horizon=self.best_hyperparam_config.horizon,
+                batch_size=self.best_hyperparam_config.batch_size,
+                patience=self.best_hyperparam_config.patience,
+                seed=self.best_hyperparam_config.seed,
+                hidden_size=self.best_hyperparam_config.hidden_size,
+                num_layers=self.best_hyperparam_config.num_layers,
+                dropout=self.best_hyperparam_config.dropout,
+                lr=self.best_hyperparam_config.lr,
+                optimizer=self.best_hyperparam_config.optimizer,
+            )
+
+            self.run_experiment(cfg)
+
+    def predict(self, loader: DataLoader, model: LSTMRegressor = None) -> Tuple[float, np.ndarray, np.ndarray]:
         """
         Generate predictions and loss for a loader.
 
         Args:
-            loader: DataLoader to generate predictions for.
+            :param loader: DataLoader to generate predictions for.
+            :param model: Specify the model to predict, if None, use the best model
 
         Returns:
             Tuple of (average loss, predictions array, ground-truth array).
         """
-        self.best_model.eval()
+        if model is None:
+            model = self.best_model
+
+        if model is None:
+            raise ValueError("No model available for prediction.")
+
+        model.eval()
 
         total, n = 0.0, 0
         predictions = []
@@ -287,7 +365,7 @@ class ExperimentRunner:
         with torch.no_grad():
             for xb, yb in loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
-                pred = self.best_model(xb).to(device=self.device)
+                pred = model(xb).to(device=self.device)
                 predictions.append(pred.cpu().numpy())
                 trues.append(yb.cpu().numpy())
 
@@ -319,9 +397,6 @@ class ExperimentRunner:
         dummy[:, 0] = values
         unscaled = self.data_manager.scaler.inverse_transform(dummy)
         return unscaled[:, 0]
-
-    def get_best_hyperparam_config(self) -> HyperparamConfig:
-        return self.best_hyperparam_config
 
     @staticmethod
     def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, loss: float) -> MetricsSummary:
@@ -373,7 +448,6 @@ class ExperimentRunner:
             loss_scale="scaled",
         )
 
-
     def _predict_full_series(self) -> tuple[np.ndarray, np.ndarray]:
         """
         Predict target values for all available dates after window/horizon.
@@ -417,11 +491,11 @@ class ExperimentRunner:
         return unscaled_preds, pred_dates.to_numpy()
 
     def simulate_trading(
-        self,
-        start_date: str,
-        end_date: str,
-        starting_capital: float,
-        strategy: TradingStrategy,
+            self,
+            start_date: str,
+            end_date: str,
+            starting_capital: float,
+            strategy: TradingStrategy,
     ) -> dict:
         """
         Simulate a trading strategy over a date range using model predictions.
@@ -551,16 +625,16 @@ class ExperimentRunner:
             )]
 
     def run_shap_analysis(
-        self,
-        run_dir: Optional[Path] = None,
-        max_background: int = 128,
-        max_samples: int = 256,
+            self,
+            run_dir: Optional[Path] = None,
+            max_background: int = 128,
+            max_samples: int = 256,
     ) -> pd.DataFrame:
         """
         Compute a SHAP summary for the best model on the test split.
 
         The analysis aggregates mean absolute SHAP values over timesteps,
-        returning a per-feature importance table.
+        returning a per-feature importance table and plots.
         """
         if self.best_model is None or self.best_hyperparam_config is None:
             raise ValueError("No trained model available for SHAP analysis.")
@@ -582,18 +656,42 @@ class ExperimentRunner:
         if background is None or samples is None:
             raise ValueError("Not enough data to compute SHAP values.")
 
-        self.best_model.eval()
+        self.best_model.train()
         self.best_model.to(self.device)
+
+        with torch.backends.cudnn.flags(enabled=False):
+            explainer = shap.GradientExplainer(self.best_model, background)
+            shap_values = explainer.shap_values(samples)
 
         explainer = shap.GradientExplainer(self.best_model, background)
         shap_values = explainer.shap_values(samples)
         if isinstance(shap_values, list):
             shap_values = shap_values[0]
 
+        samples_np = samples.detach().cpu().numpy()
         shap_values = np.asarray(shap_values)
+        if shap_values.ndim == 4 and shap_values.shape[-1] == 1:
+            shap_values = shap_values[..., 0]
+        if shap_values.ndim == 2:
+            shap_values = shap_values[:, None, :]
+            samples_np = samples_np[:, None, :]
+        if shap_values.ndim != 3:
+            raise ValueError(f"Unexpected SHAP shape: {shap_values.shape}")
+        if samples_np.ndim != 3:
+            raise ValueError(f"Unexpected sample shape: {samples_np.shape}")
+        if shap_values.shape != samples_np.shape:
+            if (
+                    shap_values.shape[0] == samples_np.shape[0]
+                    and shap_values.shape[1] == samples_np.shape[2]
+                    and shap_values.shape[2] == samples_np.shape[1]
+            ):
+                shap_values = np.transpose(shap_values, (0, 2, 1))
+            else:
+                raise ValueError(
+                    f"SHAP/sample shape mismatch: {shap_values.shape} vs {samples_np.shape}"
+                )
+
         mean_abs = np.mean(np.abs(shap_values), axis=(0, 1))
-        if mean_abs.ndim > 1:
-            mean_abs = mean_abs.reshape(mean_abs.shape[0], -1).mean(axis=1)
         feature_names = list(self.data_manager.df.columns)
         if len(feature_names) != mean_abs.shape[0]:
             raise ValueError(
@@ -603,6 +701,50 @@ class ExperimentRunner:
         summary = pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs})
         summary = summary.sort_values("mean_abs_shap", ascending=False)
         summary.to_csv(run_dir / "shap_summary.csv", index=False)
+
+        timestep_feature_importance = np.mean(np.abs(shap_values), axis=0)
+        timestep_importance = timestep_feature_importance.mean(axis=1)
+        timestep_df = pd.DataFrame({
+            "timestep": np.arange(1, len(timestep_importance) + 1),
+            "mean_abs_shap": timestep_importance
+        })
+        timestep_df.to_csv(run_dir / "shap_timestep_importance.csv", index=False)
+        timestep_feature_df = pd.DataFrame(timestep_feature_importance, columns=feature_names)
+        timestep_feature_df.insert(0, "timestep", np.arange(1, timestep_feature_importance.shape[0] + 1))
+        timestep_feature_df.to_csv(run_dir / "shap_feature_timestep_importance.csv", index=False)
+
+        fig = PlotFactory.plot_shap_feature_importance(summary, top_n=30)
+        self.artifact_manager.save_figure(fig, run_dir, "shap_feature_importance_bar", dpi=300)
+
+        fig = PlotFactory.plot_shap_timestep_importance(timestep_importance)
+        self.artifact_manager.save_figure(fig, run_dir, "shap_timestep_importance", dpi=300)
+
+        fig = PlotFactory.plot_shap_feature_timestep_heatmap(
+            feature_names=feature_names,
+            timestep_feature_importance=timestep_feature_importance,
+            top_n=20,
+        )
+        self.artifact_manager.save_figure(fig, run_dir, "shap_feature_timestep_heatmap", dpi=300)
+
+        shap_values_agg = np.mean(shap_values, axis=1)
+        data_agg = np.mean(samples_np, axis=1)
+        shap.summary_plot(shap_values_agg, data_agg, feature_names=feature_names, show=False)
+        fig = plt.gcf()
+        self.artifact_manager.save_figure(fig, run_dir, "shap_summary_beeswarm", dpi=300)
+
+        top_features = summary["feature"].head(min(5, len(summary))).tolist()
+        for feature in top_features:
+            shap.dependence_plot(
+                feature,
+                shap_values_agg,
+                data_agg,
+                feature_names=feature_names,
+                show=False
+            )
+            fig = plt.gcf()
+            safe_name = feature.replace("/", "_").replace("\\", "_").replace(" ", "_")
+            self.artifact_manager.save_figure(fig, run_dir, f"shap_dependence_{safe_name}", dpi=300)
+
         return summary
 
     def _collect_batch_tensors(self, loader: DataLoader, max_samples: int) -> Optional[torch.Tensor]:
@@ -622,3 +764,38 @@ class ExperimentRunner:
             return None
         data = torch.cat(batches, dim=0)[:max_samples]
         return data.to(self.device)
+
+    def load_model(self, checkpoint_path, config_path):
+        """
+        Load a pre-trained model from a checkpoint file.
+
+        Args:
+            checkpoint_path: Path to the checkpoint file.
+            config_path: Path to the hyperparameter config file.
+        """
+        if not Path(checkpoint_path).exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+
+        hyperparam_config = None
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            hyperparam_config = json.load(f)
+
+        model = LSTMRegressor(
+            n_features=len(hyperparam_config["features"]),
+            hidden_size=hyperparam_config["hidden_size"],
+            num_layers=hyperparam_config["num_layers"],
+            dropout=hyperparam_config["dropout"]
+        ).to(self.device)
+
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+
+        self.best_model = model
+        self.best_hyperparam_config = HyperparamConfig(**hyperparam_config)
+
+        self.data_manager.prepare(self.best_hyperparam_config.features)
+
+
